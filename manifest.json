@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "supercleanse.slingshot",
+  "name": "Slingshot",
+  "version": "0.1.0",
+  "author": "supercleanse",
+  "license": "MIT",
+  "description": "Your newest downloads and screenshots, one click away. Slingshot puts a tray icon in the bar that drops down the latest files in your Downloads and Pictures folders, with thumbnails, and lets you drag any of them straight onto another app: drop on a terminal to paste the path, on a browser or chat app to attach the file, on a file manager to copy it. Click a file to copy it to the clipboard instead. The list refreshes itself as files arrive, and nothing polls while the dropdown is closed.",
+  "homepage": "https://github.com/supercleanse/slingshot",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Widget.qml"},
+  "barWidget": {
+    "displayName": "Slingshot",
+    "description": "Tray icon for your latest downloads and screenshots. Click it for the newest files in Downloads or Pictures, then drag one onto any app, or click it to copy. A dot appears when a new file lands.",
+    "category": "Productivity",
+    "aliases": ["slingshot", "downloads", "recent-files", "recent", "drag", "drag-and-drop", "screenshots", "pictures", "files", "clipboard"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {"maxItems": 12, "showIndicator": true, "thumbnails": true},
+    "schema": [
+      {"key": "maxItems", "type": "integer", "label": "Files to show", "min": 5, "max": 30, "step": 1, "defaultValue": 12},
+      {"key": "showIndicator", "type": "boolean", "label": "Show a dot when a new file arrives", "defaultValue": true},
+      {"key": "thumbnails", "type": "boolean", "label": "Show image thumbnails", "defaultValue": true}
+    ]
+  }
+}

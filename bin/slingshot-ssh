@@ -1,0 +1,1376 @@
+#!/usr/bin/env python3
+"""slingshot-ssh: a transparent ssh wrapper that makes file drag-and-drop work
+across SSH.
+
+When a file is dropped onto the terminal, the terminal pastes its LOCAL path.
+slingshot-ssh watches the keyboard->ssh byte stream for a paste that consists
+entirely of existing local file paths, uploads those files to the remote host
+over the already-authenticated connection (OpenSSH multiplexing), and types the
+REMOTE paths instead. Everything else passes through byte for byte.
+
+Python 3 standard library only. See docs/slingshot-ssh.md.
+"""
+
+import errno
+import fcntl
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+import tty
+import urllib.parse
+
+VERSION = "0.1.0"
+
+PASTE_START = b"\x1b[200~"
+PASTE_END = b"\x1b[201~"
+
+DEFAULT_REMOTE_DIR = "~/Downloads/Slingshot"
+DEFAULT_MAX_SIZE_MB = 200
+CONTROL_PERSIST = "120"
+
+# Tuning knobs (seconds / bytes).
+MARKER_HOLD_SECONDS = 0.05     # how long to hold a partial ESC[200~ prefix
+PASTE_GATHER_SECONDS = 2.0     # give up waiting for ESC[201~ after this
+PASTE_GATHER_MAX = 64 * 1024   # a bigger paste is never a file drop
+STATUS_DELAY_SECONDS = 0.3     # notify only if an upload takes longer
+MAX_TOKENS = 256
+
+HELP = """\
+usage: slingshot-ssh [ssh options] destination [command ...]
+
+A drop-in replacement for ssh. Interactive sessions run inside a small pty
+proxy: when you drag files onto the terminal (or paste paths to local files),
+the files are uploaded to the remote host and the remote paths are typed
+instead. Non-interactive use (a remote command, -N, -W, -O, pipes, ...) runs
+plain ssh unchanged.
+
+slingshot-specific flags (must be the first argument):
+  --slingshot-help      show this help
+  --slingshot-version   show the version
+
+environment:
+  SLINGSHOT_SSH_DISABLE=1     run plain ssh, no proxy
+  SLINGSHOT_REMOTE_DIR=DIR    remote drop dir (default ~/Downloads/Slingshot)
+  SLINGSHOT_MAX_SIZE_MB=N     largest total upload per drop (default 200)
+  SLINGSHOT_NOTIFY=0          never call notify-send
+  SLINGSHOT_SSH_BIN=PATH      the real ssh binary to run
+  SLINGSHOT_CONFIG=PATH       config file (default ~/.config/slingshot/config.toml)
+  SLINGSHOT_SSH_DEBUG=PATH    append debug lines to PATH
+
+config file ([ssh] table of ~/.config/slingshot/config.toml):
+  remote_dir = "~/Downloads/Slingshot"
+  max_size_mb = 200
+  notify = true
+"""
+
+
+def debug(msg):
+    path = os.environ.get("SLINGSHOT_SSH_DEBUG")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write("%.3f [%d] %s\n" % (time.time(), os.getpid(), msg))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Finding the real ssh
+# ---------------------------------------------------------------------------
+
+def _is_self(path):
+    try:
+        if os.path.realpath(path) == os.path.realpath(__file__):
+            return True
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        # A small wrapper script that calls us would recurse forever.
+        return head.startswith(b"#!") and b"slingshot-ssh" in head
+    except OSError:
+        return False
+
+
+def find_real_ssh():
+    override = os.environ.get("SLINGSHOT_SSH_BIN")
+    if override:
+        return override
+    candidates = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        candidates.append(os.path.join(d or ".", "ssh"))
+    candidates += ["/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh",
+                   "/opt/homebrew/bin/ssh"]
+    for cand in candidates:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) and not _is_self(cand):
+            return cand
+    return None
+
+
+def exec_ssh(real_ssh, argv):
+    os.execv(real_ssh, ["ssh"] + list(argv))
+
+
+# ---------------------------------------------------------------------------
+# ssh argument parsing
+# ---------------------------------------------------------------------------
+
+# From OpenSSH's getopt string:
+#   "1246ab:c:e:fgi:kl:m:no:p:qstvxAB:CD:E:F:GI:J:KL:MNO:P:Q:R:S:TVw:W:XYy"
+ARG_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")
+FLAG_OPTS = set("1246AaCfGgKkMNnqsTtVvXxYy")
+# Options that mean "not an interactive login session".
+NONINTERACTIVE_FLAGS = set("fGNnsTV")
+NONINTERACTIVE_ARGS = set("OQW")
+
+
+class ArgError(Exception):
+    pass
+
+
+class SshArgs:
+    def __init__(self):
+        self.opts = []                # [(letter, value-or-None)] in order
+        self.dest = None
+        self.command = []
+        self.interactive = False
+        self.reason = ""
+        self.force_tty = False
+        self.user_control = False     # user chose ControlPath/ControlMaster/-S
+        self.escape_char = "default"  # "default", None (none) or a 1-char str
+        self.remote_command_opt = False
+
+    def option_argv(self):
+        out = []
+        for letter, value in self.opts:
+            out.append("-" + letter)
+            if value is not None:
+                out.append(value)
+        return out
+
+
+def parse_o_option(value):
+    """Split an -o value into (lowercase key, value)."""
+    m = re.match(r"\s*([A-Za-z0-9]+)\s*(?:=\s*|\s+)(.*)$", value, re.S)
+    if not m:
+        return value.strip().lower(), ""
+    return m.group(1).lower(), m.group(2).strip()
+
+
+def parse_escape_char(value):
+    v = value.strip()
+    if v.lower() == "none":
+        return None
+    if len(v) == 2 and v[0] == "^":
+        return "\x7f" if v[1] == "?" else chr(ord(v[1].upper()) & 0x1F)
+    if len(v) == 1:
+        return v
+    return "default"
+
+
+def parse_ssh_args(argv):
+    """Parse ssh's command line the way OpenSSH does.
+
+    Options may also follow the destination (OpenSSH re-runs getopt after the
+    host), until the first non-option word, which starts the remote command.
+    Raises ArgError when the grammar is not understood.
+    """
+    a = SshArgs()
+    i = 0
+    n = len(argv)
+    terminated = False
+    while i < n:
+        arg = argv[i]
+        if not terminated and arg == "--":
+            terminated = True
+            i += 1
+            continue
+        if not terminated and arg.startswith("-") and len(arg) > 1:
+            j = 1
+            while j < len(arg):
+                c = arg[j]
+                if c in FLAG_OPTS:
+                    a.opts.append((c, None))
+                    j += 1
+                elif c in ARG_OPTS:
+                    value = arg[j + 1:]
+                    if value == "":
+                        i += 1
+                        if i >= n:
+                            raise ArgError("option -%s needs an argument" % c)
+                        value = argv[i]
+                    a.opts.append((c, value))
+                    break
+                else:
+                    raise ArgError("unknown option -%s" % c)
+            i += 1
+            continue
+        if a.dest is None:
+            a.dest = arg
+            i += 1
+            continue
+        a.command = list(argv[i:])
+        break
+
+    # Classify.
+    request_tty = None
+    for letter, value in a.opts:
+        if letter == "t":
+            a.force_tty = True
+        elif letter == "S":
+            a.user_control = True
+        elif letter == "e":
+            a.escape_char = parse_escape_char(value)
+        elif letter == "o":
+            key, val = parse_o_option(value)
+            if key in ("controlpath", "controlmaster"):
+                a.user_control = True
+            elif key == "escapechar":
+                a.escape_char = parse_escape_char(val)
+            elif key == "requesttty":
+                request_tty = val.lower()
+            elif key == "remotecommand" and val.lower() != "none":
+                a.remote_command_opt = True
+            elif key == "sessiontype" and val.lower() != "default":
+                a.reason = "-o SessionType"
+                return a
+            elif key in ("forkafterauthentication", "stdinnull") and \
+                    val.lower() in ("yes", "true"):
+                a.reason = "-o " + key
+                return a
+    if request_tty in ("yes", "force"):
+        a.force_tty = True
+
+    for letter, _ in a.opts:
+        if letter in NONINTERACTIVE_FLAGS or letter in NONINTERACTIVE_ARGS:
+            a.reason = "-" + letter
+            return a
+    if request_tty == "no":
+        a.reason = "RequestTTY=no"
+        return a
+    if a.dest is None:
+        a.reason = "no destination"
+        return a
+    if (a.command or a.remote_command_opt) and not a.force_tty:
+        a.reason = "remote command"
+        return a
+    a.interactive = True
+    return a
+
+
+def ssh_effective_config(real_ssh, args, timeout=3.0):
+    """Run `ssh -G` to learn the effective config (ControlMaster etc.)."""
+    argv = [real_ssh, "-G"] + args.option_argv() + ["--", args.dest]
+    out = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, timeout=timeout, check=True).stdout
+    cfg = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        key, _, val = line.partition(" ")
+        key = key.lower()
+        if key and key not in cfg:
+            cfg[key] = val.strip()
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def _parse_simple_toml(text):
+    """Tiny fallback for Pythons without tomllib: [table] + key = value."""
+    data = {}
+    table = data
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            table = data
+            for part in line[1:-1].strip().split("."):
+                table = table.setdefault(part.strip().strip('"'), {})
+            continue
+        key, sep, val = line.partition("=")
+        if not sep:
+            continue
+        val = val.strip()
+        if val.startswith('"'):
+            end = val.find('"', 1)
+            val = val[1:end] if end > 0 else val[1:]
+        else:
+            val = val.split("#", 1)[0].strip()
+            if val.lower() in ("true", "false"):
+                val = val.lower() == "true"
+            else:
+                try:
+                    val = float(val) if "." in val else int(val)
+                except ValueError:
+                    pass
+        table[key.strip()] = val
+    return data
+
+
+def load_config():
+    cfg = {
+        "remote_dir": DEFAULT_REMOTE_DIR,
+        "max_size_mb": DEFAULT_MAX_SIZE_MB,
+        "notify": True,
+    }
+    path = os.environ.get("SLINGSHOT_CONFIG")
+    if not path:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        path = os.path.join(base, "slingshot", "config.toml")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read().decode("utf-8")
+        try:
+            import tomllib  # Python 3.11+
+            data = tomllib.loads(raw)
+        except ImportError:
+            data = _parse_simple_toml(raw)
+        section = data.get("ssh", {}) if isinstance(data, dict) else {}
+        if isinstance(section, dict):
+            for key in ("remote_dir", "max_size_mb", "notify"):
+                if key in section:
+                    cfg[key] = section[key]
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # a broken config must never break ssh
+        debug("config error: %r" % e)
+    env = os.environ
+    if env.get("SLINGSHOT_REMOTE_DIR"):
+        cfg["remote_dir"] = env["SLINGSHOT_REMOTE_DIR"]
+    if env.get("SLINGSHOT_MAX_SIZE_MB"):
+        cfg["max_size_mb"] = env["SLINGSHOT_MAX_SIZE_MB"]
+    if env.get("SLINGSHOT_NOTIFY") is not None:
+        cfg["notify"] = env["SLINGSHOT_NOTIFY"].strip().lower() not in \
+            ("0", "no", "false", "off", "")
+    cfg["remote_dir"] = str(cfg["remote_dir"]).strip()
+    if "\n" in cfg["remote_dir"] or not cfg["remote_dir"]:
+        cfg["remote_dir"] = DEFAULT_REMOTE_DIR
+    try:
+        cfg["max_size_mb"] = float(cfg["max_size_mb"])
+    except (TypeError, ValueError):
+        cfg["max_size_mb"] = float(DEFAULT_MAX_SIZE_MB)
+    cfg["notify"] = bool(cfg["notify"])
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Paste detection and rewriting
+# ---------------------------------------------------------------------------
+
+SAFE_PLAIN = re.compile(r"^[A-Za-z0-9_@%+=:,./~-]+$")
+
+
+def quote_single(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def quote_double(s):
+    return '"' + re.sub(r'(["\\$`])', r"\\\1", s) + '"'
+
+
+def quote_escaped(s):
+    return re.sub(r"([^A-Za-z0-9_@%+=:,./~-])", r"\\\1", s)
+
+
+def render_path(path, style):
+    """Render a remote path in the same quoting style the source token used."""
+    if style == "single":
+        return quote_single(path)
+    if style == "double":
+        return quote_double(path)
+    if style == "escaped":
+        return quote_escaped(path)
+    if style == "uri":
+        return "file://" + urllib.parse.quote(path)
+    # plain: as-is when safe, else single-quoted
+    return path if SAFE_PLAIN.match(path) else quote_single(path)
+
+
+class PasteMatch:
+    """A paste made entirely of local file paths."""
+
+    def __init__(self, parts, bracketed, original):
+        self.parts = parts          # [("text", str) | ("path", local, style)]
+        self.bracketed = bracketed
+        self.original = original    # exact bytes as received (incl. markers)
+
+    @property
+    def paths(self):
+        return [p[1] for p in self.parts if p[0] == "path"]
+
+    def render(self, remote_paths):
+        it = iter(remote_paths)
+        out = []
+        for part in self.parts:
+            if part[0] == "text":
+                out.append(part[1])
+            else:
+                out.append(render_path(next(it), part[2]))
+        body = "".join(out).encode("utf-8", "surrogateescape")
+        if self.bracketed:
+            return PASTE_START + body + PASTE_END
+        return body
+
+
+class _FileChecker:
+    def __init__(self):
+        self.cache = {}
+
+    def resolve(self, token):
+        """Map a token's literal value to a readable local regular file."""
+        if token in self.cache:
+            return self.cache[token]
+        result = None
+        path = None
+        if token.startswith("file://"):
+            rest = token[len("file://"):]
+            slash = rest.find("/")
+            if slash >= 0:
+                host = rest[:slash]
+                if host in ("", "localhost") or host == socket.gethostname():
+                    path = os.fsdecode(urllib.parse.unquote_to_bytes(rest[slash:]))
+        elif token.startswith("~/"):
+            path = os.path.expanduser(token)
+        elif token.startswith("/"):
+            path = token
+        if path and "\x00" not in path and os.path.isabs(path):
+            try:
+                if os.path.isfile(path) and os.access(path, os.R_OK):
+                    result = path
+            except (OSError, ValueError):
+                result = None
+        self.cache[token] = result
+        return result
+
+
+def _shell_tokenize(text, foot_quotes):
+    """Shell-like tokenizer. Returns [("sep", s) | ("tok", value, style)] or None.
+
+    foot_quotes: inside '...', treat \\' as a literal quote (foot escapes quotes
+    in dropped file names that way, which is not POSIX).
+    """
+    out = []
+    i, n = 0, len(text)
+    ws = " \t\r\n"
+    while i < n:
+        if text[i] in ws:
+            j = i
+            while j < n and text[j] in ws:
+                j += 1
+            out.append(("sep", text[i:j]))
+            i = j
+            continue
+        val = []
+        kinds = []
+        while i < n and text[i] not in ws:
+            c = text[i]
+            if c == "'":
+                kinds.append("single")
+                i += 1
+                while True:
+                    if i >= n:
+                        return None
+                    if text[i] == "'":
+                        i += 1
+                        break
+                    if foot_quotes and text[i] == "\\" and i + 1 < n and text[i + 1] == "'":
+                        val.append("'")
+                        i += 2
+                        continue
+                    val.append(text[i])
+                    i += 1
+            elif c == '"':
+                kinds.append("double")
+                i += 1
+                while True:
+                    if i >= n:
+                        return None
+                    ch = text[i]
+                    if ch == '"':
+                        i += 1
+                        break
+                    if ch == "\\" and i + 1 < n and text[i + 1] in '"\\$`\n':
+                        val.append(text[i + 1])
+                        i += 2
+                        continue
+                    if ch in "$`":
+                        return None
+                    val.append(ch)
+                    i += 1
+            elif c == "\\":
+                if i + 1 >= n:
+                    return None
+                kinds.append("escaped")
+                val.append(text[i + 1])
+                i += 2
+            elif c in "$`":
+                return None
+            else:
+                if not kinds or kinds[-1] != "plain":
+                    kinds.append("plain")
+                val.append(c)
+                i += 1
+        value = "".join(val)
+        if kinds == ["single"]:
+            style = "single"
+        elif kinds == ["double"]:
+            style = "double"
+        elif kinds == ["plain"]:
+            style = "uri" if value.startswith("file://") else "plain"
+        else:
+            style = "escaped"
+        out.append(("tok", value, style))
+    return out
+
+
+def _match_shell(text, checker, foot_quotes):
+    toks = _shell_tokenize(text, foot_quotes)
+    if not toks:
+        return None
+    parts = []
+    count = 0
+    for t in toks:
+        if t[0] == "sep":
+            parts.append(("text", t[1]))
+            continue
+        local = checker.resolve(t[1])
+        if local is None:
+            return None
+        parts.append(("path", local, t[2]))
+        count += 1
+        if count > MAX_TOKENS:
+            return None
+    return parts if count else None
+
+
+def _match_raw_segment(seg, checker):
+    """Split an unquoted segment containing literal spaces into existing files.
+
+    Prefers the longest file name at each step (so "/a/my file.png" wins over
+    "/a/my" + "file.png").
+    """
+    n = len(seg)
+    memo = {}
+    ends_all = [j for j in range(n) if seg[j] == " "] + [n]
+
+    def solve(i):
+        if i in memo:
+            return memo[i]
+        res = None
+        if i == n:
+            res = []
+        else:
+            for j in reversed(ends_all):
+                if j <= i:
+                    break
+                tok = seg[i:j]
+                local = checker.resolve(tok)
+                if local is None:
+                    continue
+                k = j
+                while k < n and seg[k] == " ":
+                    k += 1
+                rest = solve(k)
+                if rest is not None:
+                    style = "uri" if tok.startswith("file://") else "plain"
+                    res = [("path", local, style)]
+                    if k > j:
+                        res.append(("text", seg[j:k]))
+                    res += rest
+                    break
+        memo[i] = res
+        return res
+
+    lead = len(seg) - len(seg.lstrip(" "))
+    body = solve(lead)
+    if body is None:
+        return None
+    return ([("text", seg[:lead])] if lead else []) + body
+
+
+def _match_raw(text, checker):
+    if text.count(" ") > 4 * MAX_TOKENS:
+        return None
+    parts = []
+    count = 0
+    for piece in re.split(r"([\t\r\n]+)", text):
+        if not piece:
+            continue
+        if piece[0] in "\t\r\n" or not piece.strip(" "):
+            parts.append(("text", piece))
+            continue
+        seg = _match_raw_segment(piece, checker)
+        if seg is None:
+            return None
+        parts += seg
+        count += sum(1 for p in seg if p[0] == "path")
+    return parts if 0 < count <= MAX_TOKENS else None
+
+
+def match_paths(payload, bracketed, original=None, checker=None):
+    """Return a PasteMatch if payload (bytes) is entirely local file paths."""
+    if original is None:
+        original = (PASTE_START + payload + PASTE_END) if bracketed else payload
+    if not payload or len(payload) > PASTE_GATHER_MAX:
+        return None
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if "/" not in text or not text.strip():
+        return None
+    if any((ord(c) < 0x20 and c not in "\t\r\n") or c == "\x7f" for c in text):
+        return None
+    checker = checker or _FileChecker()
+    parts = (_match_shell(text, checker, foot_quotes=False)
+             or _match_shell(text, checker, foot_quotes=True)
+             or _match_raw(text, checker))
+    if parts is None and "\\'" in text:
+        # foot escapes ' as \' even in unquoted (alt-screen) drops
+        parts = _match_raw(text.replace("\\'", "'"), checker)
+    if parts is None:
+        return None
+    return PasteMatch(parts, bracketed, original)
+
+
+def looks_like_unbracketed_drop(data):
+    if len(data) < 2 or len(data) > PASTE_GATHER_MAX or b"\x1b" in data:
+        return False
+    if b"/" not in data:
+        return False
+    first = data.lstrip(b" \t\r\n")[:1]
+    return first in (b"/", b"'", b'"', b"~", b"f")
+
+
+def _partial_marker_len(data, marker):
+    """Length of the longest suffix of data that is a proper prefix of marker."""
+    for k in range(min(len(marker) - 1, len(data)), 0, -1):
+        if data.endswith(marker[:k]):
+            return k
+    return 0
+
+
+class PasteDetector:
+    """Watches keyboard->ssh bytes. feed() returns a list of actions:
+    ("send", bytes) to forward as-is, ("paste", PasteMatch) for a file drop."""
+
+    def __init__(self, matcher=match_paths):
+        self.matcher = matcher
+        self.reset()
+
+    def reset(self):
+        self.held = b""
+        self.held_since = None
+        self.in_paste = False
+        self.paste = b""
+        self.paste_since = None
+
+    def pending(self):
+        return bool(self.held) or self.in_paste
+
+    def deadline(self):
+        if self.in_paste:
+            return self.paste_since + PASTE_GATHER_SECONDS
+        if self.held:
+            return self.held_since + MARKER_HOLD_SECONDS
+        return None
+
+    def poll(self, now):
+        """Flush anything held for too long."""
+        out = []
+        if self.in_paste and now - self.paste_since >= PASTE_GATHER_SECONDS:
+            out.append(("send", PASTE_START + self.paste))
+            self.in_paste = False
+            self.paste = b""
+        elif self.held and now - self.held_since >= MARKER_HOLD_SECONDS:
+            out.append(("send", self.held))
+            self.held = b""
+        return out
+
+    def _match(self, payload, bracketed, original):
+        try:
+            return self.matcher(payload, bracketed, original)
+        except Exception as e:  # never let detection break typing
+            debug("matcher error: %r" % e)
+            return None
+
+    def feed(self, data, now):
+        out = []
+
+        def send(b):
+            if not b:
+                return
+            if out and out[-1][0] == "send":
+                out[-1] = ("send", out[-1][1] + b)
+            else:
+                out.append(("send", b))
+
+        if not self.in_paste and not self.held and looks_like_unbracketed_drop(data):
+            m = self._match(data, False, data)
+            if m is not None:
+                return [("paste", m)]
+
+        data = self.held + data
+        self.held = b""
+        while data:
+            if not self.in_paste:
+                idx = data.find(PASTE_START)
+                if idx < 0:
+                    k = _partial_marker_len(data, PASTE_START)
+                    # Hold a possible split marker briefly, but never a lone
+                    # ESC keypress (a 1-byte read): vim users need it now.
+                    if k >= 2 or (k == 1 and len(data) > 1):
+                        send(data[:-k])
+                        self.held = data[-k:]
+                        self.held_since = now
+                    else:
+                        send(data)
+                    break
+                send(data[:idx])
+                data = data[idx + len(PASTE_START):]
+                self.in_paste = True
+                self.paste = b""
+                self.paste_since = now
+            else:
+                self.paste += data
+                data = b""
+                idx = self.paste.find(PASTE_END)
+                if idx < 0:
+                    if len(self.paste) > PASTE_GATHER_MAX:
+                        send(PASTE_START + self.paste)
+                        self.in_paste = False
+                        self.paste = b""
+                    break
+                payload = self.paste[:idx]
+                data = self.paste[idx + len(PASTE_END):]
+                self.in_paste = False
+                self.paste = b""
+                original = PASTE_START + payload + PASTE_END
+                m = self._match(payload, True, original)
+                if m is not None:
+                    out.append(("paste", m))
+                else:
+                    send(original)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Uploading
+# ---------------------------------------------------------------------------
+
+# Runs under the remote user's login shell as: sh -c '<script>'
+# Contains no single quotes and no backslashes, so it survives sh, bash, zsh
+# and fish quoting alike, and carries no user data: the target dir and file
+# name arrive as the first two lines of stdin, then the file bytes. Never
+# overwrites (noclobber + numbered suffix). Prints "<size> <absolute path>".
+REMOTE_SCRIPT = (
+    'IFS= read -r d || exit 90; IFS= read -r n || exit 91; '
+    'case "$d" in "~") d="$HOME";; "~/"*) d="$HOME/${d#??}";; esac; '
+    'mkdir -p "$d" && cd -P "$d" || exit 92; set -C; '
+    'case "$n" in ?*.*) b="${n%.*}"; x=".${n##*.}";; *) b="$n"; x="";; esac; '
+    'f="$n"; i=1; '
+    'until { true > "$f"; } 2>/dev/null; do i=$((i+1)); '
+    '[ "$i" -gt 999 ] && exit 93; f="$b-$i$x"; done; '
+    'cat >> "$f" || exit 94; '
+    's=$(wc -c < "$f" | tr -d " "); printf "%s %s/%s" "$s" "$PWD" "$f"'
+)
+REMOTE_COMMAND = "sh -c '" + REMOTE_SCRIPT + "'"
+assert "'" not in REMOTE_SCRIPT and "\\" not in REMOTE_SCRIPT
+
+
+class UploadError(Exception):
+    pass
+
+
+# User options that must not be repeated on an upload connection.
+_UPLOAD_DROP_FLAGS = set("tTfNnMsGVv")
+_UPLOAD_DROP_ARGS = set("LRDOWQ")
+_UPLOAD_DROP_O = {"requesttty", "remotecommand", "localcommand", "permitlocalcommand",
+                  "localforward", "remoteforward", "dynamicforward", "controlmaster",
+                  "controlpersist", "sessiontype", "stdinnull", "forkafterauthentication",
+                  "batchmode", "escapechar", "loglevel"}
+
+
+class Uploader:
+    def __init__(self, real_ssh, args, control_path, remote_dir):
+        self.real_ssh = real_ssh
+        self.args = args
+        self.control_path = control_path    # None when the user manages it
+        self.remote_dir = remote_dir
+        self.lock = threading.Lock()
+        self.proc = None
+        self.canceled = False
+
+    def argv(self):
+        argv = [self.real_ssh, "-T", "-x",
+                "-o", "BatchMode=yes",
+                "-o", "ControlMaster=no",
+                "-o", "ClearAllForwardings=yes",
+                "-o", "PermitLocalCommand=no",
+                "-o", "RemoteCommand=none",
+                "-o", "LogLevel=ERROR",
+                "-o", "ConnectTimeout=15"]
+        if self.control_path:
+            argv += ["-o", "ControlPath=" + self.control_path]
+        for letter, value in self.args.opts:
+            if letter in _UPLOAD_DROP_FLAGS or letter in _UPLOAD_DROP_ARGS:
+                continue
+            if letter == "o" and parse_o_option(value)[0] in _UPLOAD_DROP_O:
+                continue
+            argv.append("-" + letter)
+            if value is not None:
+                argv.append(value)
+        argv += ["--", self.args.dest, REMOTE_COMMAND]
+        return argv
+
+    def cancel(self):
+        with self.lock:
+            self.canceled = True
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+
+    def upload(self, local):
+        name = os.path.basename(local)
+        if not name or "\n" in name or "\r" in name:
+            raise UploadError("unsupported file name")
+        size = os.path.getsize(local)
+        timeout = 30 + size / (512 * 1024)   # generous: 0.5 MB/s floor
+        header = (self.remote_dir + "\n").encode("utf-8", "surrogateescape") + \
+            os.fsencode(name) + b"\n"
+        with open(local, "rb") as src, tempfile.TemporaryFile() as errf:
+            with self.lock:
+                if self.canceled:
+                    raise UploadError("canceled")
+                proc = subprocess.Popen(self.argv(), stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=errf,
+                                        start_new_session=True, close_fds=True)
+                self.proc = proc
+
+            def feed():
+                try:
+                    proc.stdin.write(header)
+                    shutil.copyfileobj(src, proc.stdin, 1 << 20)
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
+
+            writer = threading.Thread(target=feed, daemon=True)
+            writer.start()
+            timer = threading.Timer(timeout, proc.kill)
+            timer.daemon = True
+            timer.start()
+            try:
+                out = proc.stdout.read()
+                rc = proc.wait()
+            finally:
+                timer.cancel()
+                writer.join(5)
+            errf.seek(0)
+            err = errf.read().decode("utf-8", "replace").strip()
+        if self.canceled:
+            raise UploadError("canceled")
+        if rc != 0:
+            raise UploadError((err.splitlines() or ["ssh exited %d" % rc])[-1])
+        text = out.decode("utf-8", "surrogateescape")
+        got, _, remote = text.partition(" ")
+        if not remote.startswith("/"):
+            raise UploadError("unexpected reply from remote: %r" % text[:80])
+        if got.strip() != str(size):
+            raise UploadError("size mismatch (%s of %d bytes)" % (got, size))
+        return remote
+
+    def upload_all(self, local_paths):
+        return [self.upload(p) for p in local_paths]
+
+
+# ---------------------------------------------------------------------------
+# Notifications (out of band, so the remote TUI's screen is never touched)
+# ---------------------------------------------------------------------------
+
+class Notifier:
+    def __init__(self, enabled):
+        self.cmd = shutil.which("notify-send") if enabled else None
+
+    def __call__(self, summary, body="", urgency="normal", ms=2500):
+        if not self.cmd:
+            return
+        argv = [self.cmd, "-a", "Slingshot", "-u", urgency, "-t", str(ms),
+                "-h", "string:x-canonical-private-synchronous:slingshot-ssh",
+                summary, body]
+        try:
+            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True,
+                                 close_fds=True)
+            threading.Thread(target=p.wait, daemon=True).start()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# The pty proxy
+# ---------------------------------------------------------------------------
+
+def get_winsize(fd):
+    try:
+        return fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+    except OSError:
+        return None
+
+
+def set_winsize(fd, ws):
+    if ws:
+        try:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, ws)
+        except OSError:
+            pass
+
+
+def control_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base and os.path.isdir(base):
+        d = os.path.join(base, "slingshot-ssh")
+    else:
+        # Short on purpose: unix socket paths are capped near 104 bytes.
+        d = "/tmp/slingshot-ssh-%d" % os.getuid()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    st = os.lstat(d)
+    if st.st_uid != os.getuid() or os.path.islink(d) or not os.path.isdir(d):
+        raise OSError("unsafe control dir %s" % d)
+    os.chmod(d, 0o700)
+    return d
+
+
+class Proxy:
+    def __init__(self, real_ssh, argv, args, ssh_cfg, cfg):
+        self.real_ssh = real_ssh
+        self.user_argv = list(argv)
+        self.args = args
+        self.notify = Notifier(cfg.get("notify", True))
+        self.max_bytes = int(float(cfg["max_size_mb"]) * 1024 * 1024)
+
+        has_own_mux = (ssh_cfg.get("controlmaster", "false") not in ("false", "no")
+                       and ssh_cfg.get("controlpath", "none") not in ("", "none"))
+        self.control_path = None
+        self.extra = []
+        if not args.user_control and not has_own_mux:
+            self.control_path = os.path.join(control_dir(), "cm-%C")
+            self.extra = ["-o", "ControlMaster=auto",
+                          "-o", "ControlPath=" + self.control_path,
+                          "-o", "ControlPersist=" + CONTROL_PERSIST]
+        self.uploader = Uploader(real_ssh, args, self.control_path, cfg["remote_dir"])
+
+        esc = args.escape_char
+        if esc == "default":
+            esc = parse_escape_char(ssh_cfg.get("escapechar", "~"))
+            if esc == "default":
+                esc = "~"
+        self.escape = esc.encode("latin-1") if esc else None
+        self.at_line_start = True
+        self.escape_pending = False
+
+        self.detector = PasteDetector()
+        self.to_ssh = bytearray()
+        self.backlog = []           # deferred input while an upload runs
+        self.pending = None         # the running upload
+        self.generation = 0
+        self.results = []
+        self.child_status = None
+        self.stdin_open = True
+
+    # -- tty helpers -------------------------------------------------------
+    def enter_raw(self):
+        try:
+            tty.setraw(0, termios.TCSANOW)
+        except termios.error:
+            pass
+
+    def restore_tty(self):
+        try:
+            termios.tcsetattr(0, termios.TCSADRAIN, self.saved_attrs)
+        except termios.error:
+            pass
+
+    def suspend(self):
+        debug("suspending")
+        self.restore_tty()
+        os.kill(os.getpid(), signal.SIGSTOP)
+        # ...resumed by fg
+        self.enter_raw()
+        set_winsize(self.master, get_winsize(0))
+
+    # -- byte routing ------------------------------------------------------
+    def send_to_ssh(self, data):
+        """Queue bytes for ssh. Mirrors ssh's escape parsing so that ~^Z
+        (which cannot stop ssh inside our pty: its process group is orphaned)
+        suspends slingshot-ssh itself, as it would suspend plain ssh."""
+        suspend = False
+        if self.escape:
+            e = self.escape[0]
+            for b in data:
+                if self.escape_pending:
+                    self.escape_pending = False
+                    if b == 0x1A:
+                        suspend = True
+                    self.at_line_start = b in (0x0D, 0x0A)
+                elif self.at_line_start and b == e:
+                    self.escape_pending = True
+                    self.at_line_start = False
+                else:
+                    self.at_line_start = b in (0x0D, 0x0A)
+        self.to_ssh += data
+        if suspend:
+            self.flush_to_ssh(block=True)
+            self.suspend()
+
+    def flush_to_ssh(self, block=False):
+        deadline = time.monotonic() + 1.0
+        while self.to_ssh:
+            try:
+                n = os.write(self.master, self.to_ssh)
+                del self.to_ssh[:n]
+            except BlockingIOError:
+                if not block or time.monotonic() > deadline:
+                    return
+                select.select([], [self.master], [], 0.05)
+            except OSError:
+                self.to_ssh.clear()
+                return
+
+    def handle_actions(self, actions):
+        for idx, (kind, val) in enumerate(actions):
+            if kind == "send":
+                self.send_to_ssh(val)
+            elif self.start_upload(val):
+                rest = actions[idx + 1:]
+                if rest:
+                    self.backlog.insert(0, ("actions", rest))
+                return
+
+    def process_input(self, data):
+        if self.pending:
+            self.backlog.append(("raw", data))
+            if b"\x03" in data:
+                self.cancel_upload()
+            return
+        try:
+            actions = self.detector.feed(data, time.monotonic())
+        except Exception as e:
+            debug("detector error: %r" % e)
+            self.detector.reset()
+            actions = [("send", data)]
+        self.handle_actions(actions)
+
+    def drain_backlog(self):
+        while self.backlog and not self.pending:
+            kind, val = self.backlog.pop(0)
+            if kind == "actions":
+                self.handle_actions(val)
+            else:
+                self.process_input(val)
+
+    # -- uploads -----------------------------------------------------------
+    def start_upload(self, match):
+        """Begin uploading; returns True if the paste is now pending."""
+        try:
+            total = sum(os.path.getsize(p) for p in match.paths)
+        except OSError:
+            self.send_to_ssh(match.original)
+            return False
+        if total > self.max_bytes:
+            self.notify("Slingshot: file too large",
+                        "%.1f MB is over the %.0f MB limit; pasted the local path."
+                        % (total / 1048576.0, self.max_bytes / 1048576.0))
+            self.send_to_ssh(match.original)
+            return False
+        self.generation += 1
+        gen = self.generation
+        self.uploader.canceled = False
+        self.pending = {"match": match, "gen": gen, "start": time.monotonic(),
+                        "notified": False}
+        debug("upload start: %r" % (match.paths,))
+
+        def work():
+            try:
+                res = ("ok", self.uploader.upload_all(match.paths))
+            except Exception as e:
+                res = ("err", str(e) or e.__class__.__name__)
+            self.results.append((gen, res))
+            try:
+                os.write(self.work_w, b"x")
+            except OSError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def cancel_upload(self):
+        if self.pending:
+            debug("upload canceled")
+            self.uploader.cancel()
+            self.finish_upload(("err", "canceled"), quiet=True)
+
+    def finish_upload(self, res, quiet=False):
+        match = self.pending["match"]
+        self.pending = None
+        if res[0] == "ok":
+            debug("upload ok: %r" % (res[1],))
+            self.send_to_ssh(match.render(res[1]))
+        else:
+            debug("upload failed: %s" % res[1])
+            if not quiet:
+                self.notify("Slingshot: upload failed",
+                            "%s\nPasted the local path instead." % res[1],
+                            urgency="critical")
+            self.send_to_ssh(match.original)
+        self.drain_backlog()
+
+    # -- main loop ---------------------------------------------------------
+    def run(self):
+        self.saved_attrs = termios.tcgetattr(0)
+        winsz = get_winsize(0)
+        argv = ["ssh"] + self.extra + self.user_argv
+        debug("exec %r" % (argv,))
+        pid, master = os.forkpty()
+        if pid == 0:
+            try:
+                termios.tcsetattr(0, termios.TCSANOW, self.saved_attrs)
+                set_winsize(0, winsz)
+            except Exception:
+                pass
+            try:
+                os.execv(self.real_ssh, argv)
+            finally:
+                os._exit(255)
+        self.pid = pid
+        self.master = master
+        os.set_blocking(master, False)
+        self.work_r, self.work_w = os.pipe()
+        sig_r, sig_w = os.pipe()
+        for fd in (self.work_r, self.work_w, sig_r, sig_w):
+            os.set_blocking(fd, False)
+            os.set_inheritable(fd, False)
+        signals = {}
+
+        def on_signal(signum, frame):
+            signals[signum] = True
+
+        old_wakeup = signal.set_wakeup_fd(sig_w)
+        old_handlers = {}
+        for s in (signal.SIGWINCH, signal.SIGCHLD, signal.SIGHUP, signal.SIGTERM,
+                  signal.SIGTSTP, signal.SIGCONT, signal.SIGINT, signal.SIGQUIT):
+            old_handlers[s] = signal.signal(s, on_signal)
+        self.enter_raw()
+        try:
+            self.loop(signals, sig_r)
+        finally:
+            self.restore_tty()
+            signal.set_wakeup_fd(old_wakeup)
+            for s, h in old_handlers.items():
+                try:
+                    signal.signal(s, h)
+                except (TypeError, ValueError):
+                    pass
+            if self.child_status is None:
+                try:
+                    os.kill(pid, signal.SIGHUP)
+                    _, st = os.waitpid(pid, 0)
+                    self.child_status = st
+                except OSError:
+                    pass
+        st = self.child_status
+        if st is None:
+            return 255
+        if os.WIFSIGNALED(st):
+            return 128 + os.WTERMSIG(st)
+        return os.WEXITSTATUS(st) if os.WIFEXITED(st) else 255
+
+    def _reap(self, block):
+        try:
+            wpid, st = os.waitpid(self.pid, 0 if block else os.WNOHANG)
+        except ChildProcessError:
+            wpid, st = self.pid, 0
+        if wpid == self.pid:
+            self.child_status = st
+            return True
+        return False
+
+    def loop(self, signals, sig_r):
+        master = self.master
+        exit_deadline = None
+        while True:
+            now = time.monotonic()
+            timeouts = []
+            if not self.pending:
+                dl = self.detector.deadline()
+                if dl is not None:
+                    timeouts.append(dl - now)
+            elif not self.pending["notified"]:
+                timeouts.append(self.pending["start"] + STATUS_DELAY_SECONDS - now)
+            if exit_deadline is not None:
+                timeouts.append(exit_deadline - now)
+            timeout = max(0.0, min(timeouts)) if timeouts else None
+
+            rfds = [master, sig_r, self.work_r]
+            if self.stdin_open and exit_deadline is None:
+                rfds.append(0)
+            wfds = [master] if self.to_ssh else []
+            try:
+                r, _, _ = select.select(rfds, wfds, [], timeout)
+            except InterruptedError:
+                r = []
+
+            if sig_r in r:
+                try:
+                    os.read(sig_r, 512)
+                except OSError:
+                    pass
+            if signals:
+                got = dict(signals)
+                signals.clear()
+                if got.get(signal.SIGWINCH):
+                    set_winsize(master, get_winsize(0))
+                for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT, signal.SIGQUIT):
+                    # In raw mode these never come from the keyboard; they were
+                    # sent to us on purpose, so hand them to ssh.
+                    if got.get(s):
+                        try:
+                            os.kill(self.pid, s)
+                        except OSError:
+                            pass
+                if got.get(signal.SIGTSTP):
+                    self.suspend()
+                if got.get(signal.SIGCONT):
+                    self.enter_raw()
+                    set_winsize(master, get_winsize(0))
+                if got.get(signal.SIGCHLD) and self.child_status is None:
+                    if self._reap(block=False):
+                        exit_deadline = time.monotonic() + 0.2
+
+            if master in r:
+                try:
+                    data = os.read(master, 65536)
+                except BlockingIOError:
+                    data = None
+                except OSError:
+                    data = b""
+                if data:
+                    self.write_out(data)
+                    if exit_deadline is not None:
+                        exit_deadline = time.monotonic() + 0.2
+                elif data == b"":
+                    if self.child_status is None:
+                        self._reap(block=True)
+                    return
+
+            if 0 in r:
+                try:
+                    data = os.read(0, 65536)
+                except OSError:
+                    data = b""
+                if data:
+                    self.process_input(data)
+                else:
+                    self.stdin_open = False
+                    try:
+                        os.kill(self.pid, signal.SIGHUP)
+                    except OSError:
+                        pass
+
+            if self.work_r in r:
+                try:
+                    os.read(self.work_r, 512)
+                except OSError:
+                    pass
+            while self.results:
+                gen, res = self.results.pop(0)
+                if self.pending and self.pending["gen"] == gen:
+                    self.finish_upload(res)
+
+            now = time.monotonic()
+            if self.pending and not self.pending["notified"] and \
+                    now - self.pending["start"] >= STATUS_DELAY_SECONDS:
+                self.pending["notified"] = True
+                names = ", ".join(os.path.basename(p) for p in self.pending["match"].paths)
+                self.notify("Slingshot: uploading to %s" % self.args.dest,
+                            names + "\n(Ctrl-C cancels)", ms=1500)
+            if not self.pending and self.detector.pending():
+                self.handle_actions(self.detector.poll(now))
+
+            if self.to_ssh:
+                self.flush_to_ssh()
+
+            if exit_deadline is not None and time.monotonic() >= exit_deadline:
+                return
+
+    def write_out(self, data):
+        view = memoryview(data)
+        while view:
+            try:
+                n = os.write(1, view)
+                view = view[n:]
+            except BlockingIOError:
+                select.select([], [1], [], 1.0)
+            except OSError as e:
+                if e.errno in (errno.EIO, errno.EPIPE):
+                    return
+                raise
+
+
+def main(argv):
+    if argv[:1] == ["--slingshot-version"]:
+        print("slingshot-ssh %s" % VERSION)
+        return 0
+    if argv[:1] == ["--slingshot-help"]:
+        sys.stdout.write(HELP)
+        return 0
+    real_ssh = find_real_ssh()
+    if not real_ssh:
+        sys.stderr.write("slingshot-ssh: cannot find the real ssh binary\n")
+        return 255
+    if os.environ.get("SLINGSHOT_SSH_DISABLE", "").strip() not in ("", "0"):
+        exec_ssh(real_ssh, argv)
+    if not (os.isatty(0) and os.isatty(1)):
+        exec_ssh(real_ssh, argv)
+    try:
+        args = parse_ssh_args(argv)
+    except ArgError as e:
+        debug("arg parse fallback: %s" % e)
+        exec_ssh(real_ssh, argv)
+    if not args.interactive:
+        debug("passthrough: %s" % args.reason)
+        exec_ssh(real_ssh, argv)
+    try:
+        ssh_cfg = ssh_effective_config(real_ssh, args)
+        req = ssh_cfg.get("requesttty", "auto")
+        remote_cmd = ssh_cfg.get("remotecommand", "none")
+        if req == "no" or ssh_cfg.get("sessiontype", "default") not in ("default", ""):
+            exec_ssh(real_ssh, argv)
+        if remote_cmd not in ("", "none") and not args.force_tty and \
+                req not in ("yes", "force"):
+            exec_ssh(real_ssh, argv)
+        proxy = Proxy(real_ssh, argv, args, ssh_cfg, load_config())
+    except Exception as e:
+        debug("setup fallback: %r" % e)
+        exec_ssh(real_ssh, argv)
+    return proxy.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

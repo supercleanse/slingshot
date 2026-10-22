@@ -16,6 +16,10 @@ images. Drag any file straight out onto another app:
 Or click a file to put it on the clipboard as a file, then paste wherever you
 like.
 
+Working over SSH? The optional `slingshot-ssh` wrapper makes a drop onto a
+terminal that's logged into another machine upload the file there and type the
+remote path instead (see [SSH drop proxy](#ssh-drop-proxy)).
+
 ![Slingshot in a dark and a light theme](preview.png)
 
 ## What it does
@@ -81,6 +85,18 @@ From a local checkout, `./install.sh` copies the plugin into
 Slingshot needs `wl-clipboard` (for click-to-copy), `xdg-user-dirs` and
 `xdg-utils`, all present on a stock Omarchy install.
 
+## Remove
+
+```bash
+omarchy plugin remove supercleanse.slingshot
+```
+
+That deletes the plugin folder and takes the widget out of the bar. Slingshot
+writes no files of its own. If you set up the SSH drop proxy, also delete the
+`ssh()` function from `~/.bashrc`, remove the `~/.local/bin/slingshot-ssh`
+link, and (if you created one) `~/.config/slingshot/`. Files already uploaded
+to remote hosts stay in `~/Downloads/Slingshot` there.
+
 ### A keybinding
 
 The widget answers the usual panel IPC:
@@ -126,7 +142,27 @@ flight. After an app accepts the drop the dropdown closes; if you cancel
 Dropping a file on a terminal pastes a local path, which is useless when that
 terminal is in an SSH session. `bin/slingshot-ssh` wraps `ssh` so a dropped
 local file path is uploaded to the remote host and the remote path is typed
-instead. See [docs/slingshot-ssh.md](docs/slingshot-ssh.md).
+instead. Normal typing and normal pastes pass through untouched, and
+non-interactive ssh (commands, pipes, tunnels) goes straight to the real
+`ssh`.
+
+It's opt-in and never set up for you. After `omarchy plugin add`:
+
+```bash
+ln -s ~/.config/omarchy/plugins/supercleanse.slingshot/bin/slingshot-ssh ~/.local/bin/slingshot-ssh
+```
+
+then add this to `~/.bashrc` and open a new terminal:
+
+```bash
+command -v slingshot-ssh >/dev/null && ssh() { slingshot-ssh "$@"; }
+```
+
+It needs `python3` (standard library only) and uses `notify-send`, if
+present, to report upload failures. Uploads ride the session's own SSH
+connection, so there's no second password prompt. See
+[docs/slingshot-ssh.md](docs/slingshot-ssh.md) for how it works and its
+settings.
 
 ## Development
 
@@ -162,7 +198,7 @@ can't be exercised offscreen; check it by hand:
 ## Credits
 
 `DropdownWindow.qml` is adapted from `shell/Ui/KeyboardPanel.qml` in
-[Omarchy](https://github.com/basecamp/omarchy) (MIT). Glyphs are from Nerd
+[Omarchy](https://github.com/omacom/omarchy) (MIT). Glyphs are from Nerd
 Fonts (Material Design Icons).
 
 ## License

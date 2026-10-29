@@ -26,6 +26,7 @@ Item {
   signal folderRequested(string key)
   signal copyRequested(string path)
   signal openRequested(string path)
+  signal pasteRequested(string path)
   signal openFolderRequested()
   signal dragStarted(string path)
   signal dragFinished(string path, int dropAction)
@@ -131,12 +132,14 @@ Item {
             now: root.now
             copied: root.copiedPath !== "" && root.copiedPath === modelData.path
             thumbnails: root.thumbnails
+            number: index < 10 ? index + 1 : 0
             hasCursor: root.cursorIndex === index
             foreground: root.foreground
             fontFamily: root.fontFamily
             onHoverEntered: root.rowHovered(index)
             onCopyRequested: root.copyRequested(modelData.path)
             onOpenRequested: root.openRequested(modelData.path)
+            onPasteRequested: root.pasteRequested(modelData.path)
             onDragStarted: root.dragStarted(modelData.path)
             onDragFinished: function(dropAction) { root.dragFinished(modelData.path, dropAction) }
           }
@@ -202,7 +205,7 @@ Item {
       Layout.fillWidth: true
       visible: root.showList
       textFormat: Text.PlainText
-      text: "Drag a file onto any app, or click to copy it"
+      text: "Click or 1–0 to paste · Right-click to copy · Or drag"
       color: root.dim
       horizontalAlignment: Text.AlignHCenter
       elide: Text.ElideRight

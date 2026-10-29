@@ -13,8 +13,9 @@ import "Model.js" as Model
 // release happens in another client, and a binding would leave the drag
 // state stuck until the next press.
 //
-// Left click copies the file, middle click opens it. Visuals follow the
-// Omarchy CursorSurface contract: the panel owns the cursor, hover only
+// Left click pastes the file into the window that had focus before the
+// dropdown opened, middle click opens it, right click copies it. Visuals follow
+// the Omarchy CursorSurface contract: the panel owns the cursor, hover only
 // moves it.
 CursorSurface {
   id: row
@@ -23,10 +24,13 @@ CursorSurface {
   property real now: Date.now()
   property bool copied: false
   property bool thumbnails: true
+  // 1-10 shows the number key that pastes this row (10 shows as 0); 0 hides it.
+  property int number: 0
   property string fontFamily: Style.font.family
 
   signal copyRequested()
   signal openRequested()
+  signal pasteRequested()
   signal dragStarted()
   signal dragFinished(int dropAction)
   signal hoverEntered()
@@ -86,11 +90,24 @@ CursorSurface {
       }
     }
 
+    Text {
+      id: numberLabel
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      visible: row.number > 0
+      textFormat: Text.PlainText
+      text: row.number === 10 ? "0" : String(row.number)
+      color: row.dim
+      font.family: row.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
     Column {
       id: info
       anchors.left: thumbBox.right
       anchors.leftMargin: Style.space(10)
       anchors.right: parent.right
+      anchors.rightMargin: numberLabel.visible ? numberLabel.implicitWidth + Style.space(8) : 0
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.space(2)
 
@@ -140,7 +157,7 @@ CursorSurface {
     anchors.fill: parent
     hoverEnabled: true
     preventStealing: true
-    acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+    acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
     cursorShape: dragging ? Qt.ClosedHandCursor : Qt.PointingHandCursor
 
     property bool armed: false
@@ -176,7 +193,8 @@ CursorSurface {
     onClicked: function(event) {
       if (dragging) return
       if (event.button === Qt.MiddleButton) row.openRequested()
-      else row.copyRequested()
+      else if (event.button === Qt.RightButton) row.copyRequested()
+      else row.pasteRequested()
     }
   }
 }

@@ -109,6 +109,36 @@ test("uriList and dragMimeData: CRLF-terminated URIs, plain path for terminals",
   assert.equal(m["text/plain;charset=utf-8"], "/home/demo/Downloads/my file.png");
 });
 
+test("parseActiveWindow keeps a hex address and the class, and rejects junk", () => {
+  assert.deepEqual(Model.parseActiveWindow('{"address":"0xabc","class":"foot"}'), { address: "0xabc", class: "foot" });
+  assert.deepEqual(Model.parseActiveWindow('{"address":"not-an-address","class":"foot"}'), { address: "", class: "foot" });
+  assert.deepEqual(Model.parseActiveWindow("not json"), { address: "", class: "" });
+  assert.deepEqual(Model.parseActiveWindow(""), { address: "", class: "" });
+});
+
+test("parseFocusLine reads socket2 focus events and reports an empty focus as cleared", () => {
+  assert.deepEqual(Model.parseFocusLine("activewindowv2>>564527463980"), { address: "0x564527463980", class: "", cleared: false });
+  assert.deepEqual(Model.parseFocusLine("activewindowv2>>0xabc"), { address: "0xabc", class: "", cleared: false });
+  assert.deepEqual(Model.parseFocusLine("activewindowv2>>"), { address: "", class: "", cleared: true });
+  assert.deepEqual(Model.parseFocusLine("activewindow>>foot,MacBook: Dev"), { address: "", class: "foot", cleared: false });
+  assert.deepEqual(Model.parseFocusLine("activewindow>>,"), { address: "", class: "", cleared: true });
+  assert.equal(Model.parseFocusLine("activewindowv2>>not-hex!"), null);
+  assert.equal(Model.parseFocusLine("workspace>>6"), null);
+});
+
+test("pasteCommand hands paste.py the path, a clean address and the delay as arguments", () => {
+  const cmd = Model.pasteCommand("/p/paste.py", "/tmp/it's $(x).png", 350.4, "0xABC");
+  assert.deepEqual(cmd, ["python3", "/p/paste.py", "/tmp/it's $(x).png", "0xABC", "350"]);
+  assert.equal(Model.pasteCommand("/p/paste.py", "/a", 10, 'x" }) evil')[3], "");
+  assert.equal(Model.pasteCommand("/p/paste.py", "/a", -5, "")[4], "0");
+});
+
+test("localPath undoes a file URL from Qt.resolvedUrl", () => {
+  assert.equal(Model.localPath("file:///home/me/my%20plugin/paste.py"), "/home/me/my plugin/paste.py");
+  assert.equal(Model.localPath("qrc:/paste.py"), "");
+  assert.equal(Model.localPath(""), "");
+});
+
 test("clipboardCommand passes the URI as an argument, never as shell text", () => {
   const cmd = Model.clipboardCommand("/tmp/it's \"quoted\" $(rm -rf).txt");
   assert.deepEqual(cmd.slice(0, 2), ["sh", "-c"]);

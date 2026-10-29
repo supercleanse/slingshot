@@ -156,6 +156,14 @@ function fileUri(path) {
   return "file://" + p.split("/").map(function(seg) { return encodeURIComponent(seg) }).join("/")
 }
 
+// The inverse, for Qt.resolvedUrl() results: "file:///a%20b" -> "/a b".
+// Anything that isn't a file URL comes back as "".
+function localPath(url) {
+  var s = String(url || "")
+  if (s.indexOf("file://") !== 0) return ""
+  try { return decodeURIComponent(s.slice("file://".length)) } catch (e) { return "" }
+}
+
 // text/uri-list payload (RFC 2483): one URI per line, CRLF line endings.
 function uriList(paths) {
   var list = Array.isArray(paths) ? paths : [paths]
@@ -180,6 +188,54 @@ function dragMimeData(path) {
 // browser pastes the file. The URI travels as an argument, never as shell text.
 function clipboardCommand(path) {
   return ["sh", "-c", "printf '%s\\r\\n' \"$1\" | wl-copy --type text/uri-list", "slingshot-copy", fileUri(path)]
+}
+
+// Click-to-paste: paste.py (next to this file) does the work after the
+// dropdown closes: picks path text or the file for the clipboard, refocuses
+// the remembered window, and sends it the paste chord. Arguments only, never
+// shell text.
+function pasteCommand(helperPath, path, delayMs, address) {
+  var a = /^0x[0-9a-f]+$/i.test(String(address || "")) ? String(address) : ""
+  var delay = String(Math.max(0, Math.round(Number(delayMs) || 0)))
+  return ["python3", String(helperPath || ""), String(path || ""), a, delay]
+}
+
+// One line from Hyprland's socket2. activewindowv2 carries the address
+// (with or without a 0x prefix), activewindow carries "class,title". An
+// empty focus change (an empty workspace) comes back as { cleared: true } so
+// a paste never aims at a window on a workspace you have left. Every other
+// event returns null.
+function parseFocusLine(line) {
+  var s = String(line || "").replace(/\r$/, "")
+  if (s.indexOf("activewindowv2>>") === 0) {
+    var hex = s.slice("activewindowv2>>".length).trim().toLowerCase()
+    if (hex === "") return { address: "", class: "", cleared: true }
+    if (/^[0-9a-f]+$/.test(hex)) hex = "0x" + hex
+    if (!/^0x[0-9a-f]+$/.test(hex)) return null
+    return { address: hex, class: "", cleared: false }
+  }
+  if (s.indexOf("activewindow>>") === 0) {
+    var rest = s.slice("activewindow>>".length)
+    var comma = rest.indexOf(",")
+    var winClass = (comma >= 0 ? rest.slice(0, comma) : rest).trim()
+    if (!winClass) return { address: "", class: "", cleared: true }
+    return { address: "", class: winClass, cleared: false }
+  }
+  return null
+}
+
+// `hyprctl -j activewindow` -> { address, class }, both "" when no window
+// is active or the output isn't valid JSON. The address is kept only in the
+// canonical 0x-hex form so it is safe to splice into a hyprctl dispatch.
+function parseActiveWindow(text) {
+  var info = { address: "", class: "" }
+  var w = null
+  try { w = JSON.parse(String(text || "")) } catch (e) { return info }
+  if (!w || typeof w !== "object") return info
+  var address = String(w.address || "")
+  if (/^0x[0-9a-f]+$/i.test(address)) info.address = address
+  info.class = String(w.class || "")
+  return info
 }
 
 function openCommand(path) {

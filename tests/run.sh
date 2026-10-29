@@ -2,6 +2,7 @@
 # Slingshot plugin checks. Never opens a window on your desktop.
 #   1. omarchy-plugin-validate on the repo (it is the plugin)
 #   2. Model.js unit tests (node --test)
+#   2b. paste.py against fake hyprctl / wl-copy
 #   3. offscreen render + end-to-end checks against fake folders
 #      (output in ${SLINGSHOT_RENDER_DIR:-/tmp/slingshot-render})
 set -uo pipefail
@@ -22,6 +23,10 @@ if command -v node >/dev/null; then
 else
   echo "node not found; skipping" >&2; status=1
 fi
+
+echo
+echo "== paste.py (fake hyprctl/wl-copy) =="
+python3 -m unittest discover -s tests/paste || status=1
 
 echo
 echo "== Offscreen render =="

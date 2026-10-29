@@ -5,6 +5,7 @@ import json
 import os
 import pty
 import shutil
+import stat
 import signal
 import struct
 import subprocess
@@ -196,6 +197,24 @@ class TestE2E(E2EBase):
         self.assertFalse([a for a in self.entries("argv") if a["argv"][-1].startswith("sh -c")])
         with open(self.notify_log) as f:
             self.assertIn("too large", f.read())
+
+    def test_upload_keeps_source_permissions_under_a_loose_umask(self):
+        # Reported on the marketplace submission: a 0600 source used to land
+        # as 0644 under the remote's umask 022.
+        private = self.make_file("secret.txt", b"s")
+        os.chmod(private, 0o600)
+        public = self.make_file("open.txt", b"o")
+        os.chmod(public, 0o644)
+        self.spawn("fakehost", FAKE_REMOTE_UMASK="022")
+        folder = os.path.join(self.remote_home, "Downloads", "Slingshot")
+        for local, want in ((private, 0o600), (public, 0o644)):
+            os.write(self.fd, S + local.encode() + E)
+            remote = os.path.join(folder, os.path.basename(local))
+            self.wait_received(lambda got, r=remote: (S + r.encode() + E) in got)
+            self.assertEqual(stat.S_IMODE(os.stat(remote).st_mode), want, local)
+        # A folder the upload had to create is private too.
+        self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700)
+        self.finish(7)
 
     def test_custom_remote_dir(self):
         local = self.make_file("n.txt", b"n")

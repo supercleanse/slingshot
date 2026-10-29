@@ -5,7 +5,8 @@
 - `ssh ... dest 'sh -c ...'` (the upload command) runs that command with
   /bin/sh locally, with HOME=$FAKE_REMOTE_HOME, so the real remote script is
   exercised against a temp dir. FAKE_UPLOAD_FAIL=1 makes it fail instead;
-  FAKE_UPLOAD_SLEEP=N makes it slow.
+  FAKE_UPLOAD_SLEEP=N makes it slow. It runs under FAKE_REMOTE_UMASK
+  (default 022).
 - `ssh [opts] dest`        acts as an interactive remote shell on its pty:
   raw mode, logs every input chunk, answers "?" with the window size and
   exits with $FAKE_EXIT (default 7) on Ctrl-D.
@@ -49,7 +50,11 @@ def main():
             time.sleep(float(os.environ["FAKE_UPLOAD_SLEEP"]))
         home = os.environ["FAKE_REMOTE_HOME"]
         env = dict(os.environ, HOME=home)
-        return subprocess.call(["/bin/sh", "-c", argv[-1]], env=env, cwd=home)
+        # A typical permissive remote umask, so the tests see what a private
+        # file would become if the script didn't protect it.
+        umask = int(os.environ.get("FAKE_REMOTE_UMASK", "022"), 8)
+        return subprocess.call(["/bin/sh", "-c", argv[-1]], env=env, cwd=home,
+                               preexec_fn=lambda: os.umask(umask))
     if "-O" in argv:
         return 0
 

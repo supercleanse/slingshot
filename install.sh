@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install Slingshot from this checkout: copies (never symlinks) the Quickshell
 # plugin into ~/.config/omarchy/plugins/supercleanse.slingshot/ and links the
-# slingshot-ssh helper into ~/.local/bin when it is present. Safe to re-run.
+# slingshot command (and the slingshot-ssh helper, when present) into
+# ~/.local/bin. Safe to re-run.
 #
 #   ./install.sh            install or update, then ask the shell to rescan
 #
@@ -16,10 +17,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ID="supercleanse.slingshot"
 PLUGIN_DIR="${HOME}/.config/omarchy/plugins/${PLUGIN_ID}"
 BIN_DIR="${HOME}/.local/bin"
-FILES=(Widget.qml DropdownWindow.qml Content.qml FileRow.qml FolderFeed.qml Model.js LICENSE)
+FILES=(Widget.qml DropdownWindow.qml Content.qml FileRow.qml FolderFeed.qml Model.js paste.py LICENSE)
 
 case "${1:-}" in
-  -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
   "") ;;
   *) echo "unknown option: $1" >&2; exit 2 ;;
 esac
@@ -55,6 +56,13 @@ with open(dst, "w") as fh:
     fh.write("\n")
 PY
 echo "plugin  -> ${PLUGIN_DIR} (${RUNTIME})"
+
+# `slingshot paste downloads 3`: the keybinding entry point. Linked, so it
+# finds paste.py in this checkout.
+mkdir -p "${BIN_DIR}"
+chmod +x "${HERE}/bin/slingshot"
+ln -sfn "${HERE}/bin/slingshot" "${BIN_DIR}/slingshot"
+echo "command -> ${BIN_DIR}/slingshot"
 
 # SSH drop proxy (docs/slingshot-ssh.md). Linked, not copied, so it tracks
 # this checkout.

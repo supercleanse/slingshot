@@ -19,6 +19,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -770,18 +771,23 @@ class PasteDetector:
 
 # Runs under the remote user's login shell as: sh -c '<script>'
 # Contains no single quotes and no backslashes, so it survives sh, bash, zsh
-# and fish quoting alike, and carries no user data: the target dir and file
-# name arrive as the first two lines of stdin, then the file bytes. Never
-# overwrites (noclobber + numbered suffix). Prints "<size> <absolute path>".
+# and fish quoting alike, and carries no user data: the target dir, the file
+# name and the source's permission bits (three octal digits) arrive as the
+# first three lines of stdin, then the file bytes. Never overwrites
+# (noclobber + numbered suffix). Everything is created under umask 077, so a
+# new folder is private and the file is 0600 while it is written; the file
+# then gets the source's own bits, like scp -p, so a private source stays
+# private whatever the remote umask is. Prints "<size> <absolute path>".
 REMOTE_SCRIPT = (
-    'IFS= read -r d || exit 90; IFS= read -r n || exit 91; '
+    'IFS= read -r d || exit 90; IFS= read -r n || exit 91; IFS= read -r m || exit 95; '
+    'case "$m" in [0-7][0-7][0-7]) ;; *) exit 95;; esac; umask 077; '
     'case "$d" in "~") d="$HOME";; "~/"*) d="$HOME/${d#??}";; esac; '
     'mkdir -p "$d" && cd -P "$d" || exit 92; set -C; '
     'case "$n" in ?*.*) b="${n%.*}"; x=".${n##*.}";; *) b="$n"; x="";; esac; '
     'f="$n"; i=1; '
     'until { true > "$f"; } 2>/dev/null; do i=$((i+1)); '
     '[ "$i" -gt 999 ] && exit 93; f="$b-$i$x"; done; '
-    'cat >> "$f" || exit 94; '
+    'cat >> "$f" || exit 94; chmod "$m" "$f" || exit 96; '
     's=$(wc -c < "$f" | tr -d " "); printf "%s %s/%s" "$s" "$PWD" "$f"'
 )
 REMOTE_COMMAND = "sh -c '" + REMOTE_SCRIPT + "'"
@@ -846,10 +852,12 @@ class Uploader:
         name = os.path.basename(local)
         if not name or "\n" in name or "\r" in name:
             raise UploadError("unsupported file name")
-        size = os.path.getsize(local)
+        st = os.stat(local)
+        size = st.st_size
+        mode = "%03o" % (stat.S_IMODE(st.st_mode) & 0o777)
         timeout = 30 + size / (512 * 1024)   # generous: 0.5 MB/s floor
         header = (self.remote_dir + "\n").encode("utf-8", "surrogateescape") + \
-            os.fsencode(name) + b"\n"
+            os.fsencode(name) + b"\n" + mode.encode("ascii") + b"\n"
         with open(local, "rb") as src, tempfile.TemporaryFile() as errf:
             with self.lock:
                 if self.canceled:

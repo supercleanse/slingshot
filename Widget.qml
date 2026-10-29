@@ -38,6 +38,12 @@ Panel {
   property bool fresh: false
   property int cursorIndex: -1
   property string copiedPath: ""
+  // Last real window, tracked while the dropdown is closed. Opening the
+  // panel takes keyboard focus, so a query started after `opened` flips
+  // sees the layer shell instead of the app the user was in.
+  property string focusedAddress: ""
+  property string pasteTarget: ""
+  readonly property string pasteHelper: Model.localPath(Qt.resolvedUrl("paste.py"))
 
   readonly property var currentFeed: root.currentFolder === "pictures" ? pictures : downloads
   readonly property var currentFiles: root.currentFeed.files
@@ -58,6 +64,19 @@ Panel {
     root.copiedPath = ""
   }
 
+  function noteFocus(ev) {
+    if (root.opened || !ev) return
+    if (ev.cleared) root.focusedAddress = ""
+    else if (ev.address) root.focusedAddress = ev.address
+  }
+
+  // Freeze the tracked window at the moment the dropdown opens. This runs
+  // synchronously inside onOpenedChanged, before a later focus-clear event
+  // from the panel can be read.
+  function capturePasteTarget() {
+    root.pasteTarget = root.focusedAddress
+  }
+
   function moveCursor(dy) {
     root.cursorIndex = Model.moveCursor(root.cursorIndex, dy, root.currentFiles.length)
   }
@@ -72,6 +91,16 @@ Panel {
     Quickshell.execDetached(Model.clipboardCommand(path))
     root.copiedPath = path
     copiedCloseTimer.restart()
+  }
+
+  // Click: close the dropdown and let paste.py wait out the close, then
+  // refocus the remembered window and paste into it. With no window to aim
+  // at (an empty workspace), a click copies instead.
+  function pasteFile(path) {
+    if (!path) return
+    if (!root.pasteTarget) { root.copyFile(path); return }
+    Quickshell.execDetached(Model.pasteCommand(root.pasteHelper, path, 350, root.pasteTarget))
+    root.close()
   }
 
   function openFile(path) {
@@ -115,6 +144,7 @@ Panel {
       root.fresh = false
       root.cursorIndex = -1
       root.copiedPath = ""
+      root.capturePasteTarget()
       downloads.recheck()
       pictures.recheck()
       if (root.manualFolder === "")
@@ -144,6 +174,42 @@ Panel {
     }
     // xdg-user-dir missing entirely: StdioCollector still reports an empty
     // stream, which parseUserDirs maps to the xdg-user-dirs default names.
+  }
+
+  // One shot at startup, so the first click has a target before any focus
+  // event has arrived.
+  Process {
+    id: focusSeed
+    running: true
+    command: ["hyprctl", "-j", "activewindow"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var info = Model.parseActiveWindow(text)
+        root.noteFocus({ address: info.address, cleared: info.address === "" })
+      }
+    }
+  }
+
+  // Hyprland socket2. Only activewindow lines are printed. Updates stop
+  // while the dropdown is open, so the panel taking focus cannot replace
+  // the window the paste is aimed at.
+  Process {
+    id: focusWatch
+    running: true
+    command: ["python3", "-u", "-c", "import os, socket, sys\nsig = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', '')\nruntime = os.environ.get('XDG_RUNTIME_DIR', '')\nif not sig or not runtime:\n    sys.exit(0)\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.connect(runtime + '/hypr/' + sig + '/.socket2.sock')\nf = s.makefile('rb')\nwhile True:\n    line = f.readline()\n    if not line:\n        break\n    if line.startswith(b'activewindow'):\n        sys.stdout.buffer.write(line)\n        sys.stdout.flush()\n"]
+    stdout: SplitParser {
+      onRead: function(line) {
+        root.noteFocus(Model.parseFocusLine(line))
+      }
+    }
+    onExited: focusRestart.restart()
+  }
+
+  Timer {
+    id: focusRestart
+    interval: 1000
+    onTriggered: if (!focusWatch.running) focusWatch.running = true
   }
 
   // Watched while open, and while closed only for the "new file" dot.
@@ -219,11 +285,16 @@ Panel {
         if (dx !== 0) root.setFolder(dx < 0 ? "downloads" : "pictures", true)
         else root.moveCursor(dy)
       }
-      onActivateRequested: root.copyFile(root.cursorPath())
+      onActivateRequested: root.pasteFile(root.cursorPath())
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "o" || t === "O") root.openFile(root.cursorPath())
+        if (t >= "0" && t <= "9" && t.length === 1) {
+          var f = root.currentFiles[t === "0" ? 9 : Number(t) - 1]
+          if (f) root.pasteFile(f.path)
+        }
+        else if (t === "c" || t === "C") root.copyFile(root.cursorPath())
+        else if (t === "o" || t === "O") root.openFile(root.cursorPath())
         else if (t === "f" || t === "F") root.openFolder()
         else if (t === "d" || t === "D") root.setFolder("downloads", true)
         else if (t === "p" || t === "P") root.setFolder("pictures", true)
@@ -246,6 +317,7 @@ Panel {
         onFolderRequested: function(key) { root.setFolder(key, true) }
         onCopyRequested: function(path) { root.copyFile(path) }
         onOpenRequested: function(path) { root.openFile(path) }
+        onPasteRequested: function(path) { root.pasteFile(path) }
         onOpenFolderRequested: root.openFolder()
         onRowHovered: function(index) { root.cursorIndex = index }
         onDragStarted: function(path) { root.dragging = true }

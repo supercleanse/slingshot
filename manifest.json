@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "supercleanse.slingshot",
   "name": "Slingshot",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "author": "supercleanse",
   "license": "MIT",
-  "description": "Your newest downloads and screenshots, one click away. A bar icon drops down the latest files in Downloads and Pictures, with thumbnails. Drag one onto a terminal to type its path, onto a browser or chat app to attach it, or onto a file manager to copy it; click to copy it to the clipboard. The list updates as files arrive. An optional slingshot-ssh wrapper makes drops work over SSH: the file is uploaded to the remote machine and its remote path is typed.",
+  "description": "Your newest downloads and screenshots, one click away. A bar icon drops down the latest files in Downloads and Pictures, with thumbnails. Drag one onto a terminal, browser, chat app, or file manager. Click a file to paste it into the window that was focused before the menu opened. Right-click copies it. The list updates as files arrive. An optional slingshot-ssh wrapper uploads a dropped file over SSH and types the remote path.",
   "homepage": "https://github.com/supercleanse/slingshot",
   "kinds": [
     "bar-widget"
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Slingshot",
-    "description": "Tray icon for your latest downloads and screenshots. Click it for the newest files in Downloads or Pictures, then drag one onto any app, or click it to copy. A dot appears when a new file lands.",
+    "description": "Tray icon for your latest downloads and screenshots. Click it for the newest files in Downloads or Pictures, then drag one onto any app, or click a file to paste it into the window you were in. A dot appears when a new file lands.",
     "category": "Productivity",
     "aliases": [
       "slingshot",

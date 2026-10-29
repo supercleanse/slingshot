@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Paste one of your newest files without opening the dropdown.
+
+    slingshot paste downloads|pictures [N]   paste the Nth newest (1-10, default 1)
+                                             into the focused window
+    slingshot list  downloads|pictures [N]   print the N newest paths (default 10)
+
+Built for keybindings: the window you are in when you press the keys is the
+one that gets the file. A terminal gets the path, anything else gets the file
+itself (see paste.py). The list matches the dropdown's: newest first, no
+hidden files, no downloads still in progress.
+
+SLINGSHOT_DOWNLOADS / SLINGSHOT_PICTURES override the folders (for tests).
+"""
+
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+import paste as helper  # noqa: E402  (paste.py at the plugin root)
+
+# Same as Model.js PARTIAL_SUFFIXES; tests/paste checks they stay in step.
+PARTIAL_SUFFIXES = [".part", ".crdownload", ".download", ".tmp"]
+XDG_KEYS = {"downloads": ("DOWNLOAD", "Downloads"), "pictures": ("PICTURES", "Pictures")}
+
+
+def folder_path(key):
+    override = os.environ.get("SLINGSHOT_" + key.upper())
+    if override:
+        return override
+    xdg, fallback = XDG_KEYS[key]
+    home = os.path.expanduser("~")
+    try:
+        out = subprocess.run(["xdg-user-dir", xdg], capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    # xdg-user-dir answers $HOME for an unset dir; the dropdown never lists $HOME.
+    if not out or os.path.realpath(out) == os.path.realpath(home):
+        out = os.path.join(home, fallback)
+    return out
+
+
+def is_partial(name):
+    lower = name.lower()
+    return any(len(lower) > len(s) and lower.endswith(s) for s in PARTIAL_SUFFIXES)
+
+
+def recent(folder, limit):
+    """Newest-first regular files, filtered the way Model.pickRecent does."""
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return []
+    names = {e.name.lower() for e in entries}
+    kept = []
+    for e in entries:
+        name = e.name
+        if name.startswith(".") or is_partial(name):
+            continue
+        if any(name.lower() + s in names for s in PARTIAL_SUFFIXES):
+            continue  # its .part/.crdownload sibling says it is still arriving
+        try:
+            if not e.is_file():
+                continue
+            mtime = e.stat().st_mtime
+        except OSError:
+            continue
+        kept.append((-mtime, name, e.path))
+    kept.sort()
+    return [p for _, _, p in kept[:limit]]
+
+
+def usage():
+    print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    if len(argv) < 3 or argv[1] not in ("paste", "list") or argv[2] not in XDG_KEYS:
+        return usage()
+    try:
+        n = int(argv[3]) if len(argv) > 3 else (1 if argv[1] == "paste" else 10)
+    except ValueError:
+        return usage()
+    if n < 1:
+        return usage()
+
+    files = recent(folder_path(argv[2]), n)
+    if argv[1] == "list":
+        print("\n".join(files))
+        return 0
+
+    label = XDG_KEYS[argv[2]][1]
+    if len(files) < n:
+        helper.run([helper.NOTIFY, "-a", "Slingshot", "Nothing to paste",
+                    "%s has %d file%s; there is no #%d." % (label, len(files), "" if len(files) == 1 else "s", n)])
+        return 1
+    # The keys that ran this may still be held; Hyprland sends the chord with
+    # explicit mods, so a short beat is enough.
+    helper.paste(files[n - 1], helper.active_address(), 0.08)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -13,8 +13,14 @@ images. Drag any file straight out onto another app:
 - **a browser or chat app** attaches the file;
 - **a file manager** copies it.
 
-Or click a file to put it on the clipboard as a file, then paste wherever you
-like.
+Or don't drag at all: click a file (or press its number, 1 to 0) and it's
+pasted into the window you were in before you opened the menu. A terminal
+gets the path, everything else gets the file itself. Right-click copies it to
+the clipboard instead.
+
+Or skip the menu: with the [paste keys](#paste-keys) set up, Super+Alt+D
+pastes your newest download into the window you're in, and Super+Alt+Shift+D
+then 3 pastes the third-newest.
 
 Working over SSH? The optional `slingshot-ssh` wrapper makes a drop onto a
 terminal that's logged into another machine upload the file there and type the
@@ -50,19 +56,28 @@ remote path instead (see [SSH drop proxy](#ssh-drop-proxy)).
 | In the dropdown | Does |
 |---|---|
 | Drag a row | Drag the file onto another app |
-| Click a row | Copy the file to the clipboard (`text/uri-list`), then close |
+| Click a row | Paste the file into the window that was focused before the menu opened |
+| `1` … `9`, `0` | Paste the 1st … 10th file (each row shows its number) |
+| Right-click a row, or `c` | Copy the file to the clipboard (`text/uri-list`) |
 | Middle-click a row | Open the file with its default app |
 | `j` / `k` or arrows | Move the cursor |
-| `Enter` / `Space` | Copy the file under the cursor |
+| `Enter` / `Space` | Paste the file under the cursor into that previous window |
 | `o` | Open the file under the cursor |
 | `h` / `l`, `d` / `p` | Switch to Downloads / Pictures |
 | `f` | Open the folder in your file browser |
 | `Tab` | Move to the next bar panel (Omarchy's usual) |
 | `Esc` | Close |
 
-The clipboard copy offers the file as `text/uri-list`, so Ctrl+Shift+V in a
-terminal pastes its path and Ctrl+V in a file manager or browser pastes the
-file itself.
+A paste puts the right thing on the clipboard for the window it lands in. A
+terminal (Omarchy's `terminal` window tag, or a known terminal class) gets the
+shell-quoted path as plain text and Ctrl+Shift+V. Anything else gets the file
+as `text/uri-list` and Ctrl+V, which browsers, Electron chat apps and file
+managers paste as the file. If the window you came from has closed or is on a
+workspace you've left, nothing is pasted: the file is copied and a
+notification says so.
+
+Right-click copies the file as `text/uri-list`, so Ctrl+V in a file manager or
+browser pastes the file itself.
 
 ## Install
 
@@ -92,12 +107,61 @@ omarchy plugin remove supercleanse.slingshot
 ```
 
 That deletes the plugin folder and takes the widget out of the bar. Slingshot
-writes no files of its own. If you set up the SSH drop proxy, also delete the
+writes no files of its own. Remove the `~/.local/bin/slingshot` link, and the paste
+keys from `~/.config/hypr/bindings.lua` if you added them. If you set up the SSH drop proxy, also delete the
 `ssh()` function from `~/.bashrc`, remove the `~/.local/bin/slingshot-ssh`
 link, and (if you created one) `~/.config/slingshot/`. Files already uploaded
 to remote hosts stay in `~/Downloads/Slingshot` there.
 
-### A keybinding
+### Paste keys
+
+`install.sh` links a `slingshot` command into `~/.local/bin`:
+
+```bash
+slingshot paste downloads 3    # paste the 3rd-newest download into the focused window
+slingshot paste pictures       # the newest picture
+slingshot list downloads       # the ten newest paths, in dropdown order
+```
+
+It pastes into the window that has focus when it runs, so it suits a
+keybinding. With these in `~/.config/hypr/bindings.lua`:
+
+- Super+Alt+D (or P) pastes the newest download (or picture) straight away.
+- Super+Alt+Shift+D (or P) waits for one more key: `1` to `9` or `0` pastes
+  that file, and anything else cancels. You can keep the modifiers held for
+  the digit.
+
+```lua
+local function slingshot_keys(folder, label, key)
+  local submap = "slingshot-" .. folder
+  local function paste(n)
+    return hl.dsp.exec_cmd("slingshot paste " .. folder .. " " .. n)
+  end
+  hl.define_submap(submap, "reset", function()
+    for n = 1, 10 do
+      local digit = tostring(n % 10)
+      hl.bind(digit, paste(n))
+      hl.bind("SUPER + ALT + SHIFT + " .. digit, paste(n))
+    end
+    hl.bind("Escape", hl.dsp.submap("reset"))
+    hl.bind("catchall", hl.dsp.submap("reset"))
+  end)
+  o.bind("SUPER + ALT + " .. key, "Slingshot: paste newest from " .. label, paste(1))
+  o.bind("SUPER + ALT + SHIFT + " .. key, "Slingshot: paste from " .. label .. " by number", function()
+    hl.dispatch(hl.dsp.submap(submap))
+    hl.dispatch(hl.dsp.exec_cmd("notify-send -a Slingshot -u low -t 2500 -h string:x-canonical-private-synchronous:slingshot '" ..
+      label .. "' 'Press 1-9 or 0 to paste that file, Esc to cancel'"))
+  end)
+end
+slingshot_keys("downloads", "Downloads", "D")
+slingshot_keys("pictures", "Pictures", "P")
+```
+
+On a stock Omarchy all four combos are unbound. While the number mode waits,
+Super+Alt+Shift+1 to 0 mean "paste", not Omarchy's "move window silently to
+workspace".
+
+### Opening the dropdown from a key
 
 The widget answers the usual panel IPC:
 
@@ -105,10 +169,10 @@ The widget answers the usual panel IPC:
 omarchy-shell supercleanse.slingshot toggle   # also open, close
 ```
 
-So in `~/.config/hypr/bindings.lua`, for example:
+So, for example:
 
 ```lua
-o.bind("SUPER + ALT + D", "Slingshot", "omarchy-shell supercleanse.slingshot toggle")
+o.bind("SUPER + ALT + O", "Slingshot", "omarchy-shell supercleanse.slingshot toggle")
 ```
 
 ### Settings
@@ -171,7 +235,8 @@ tests/run.sh
 ```
 
 runs `omarchy-plugin-validate`, the `Model.js` unit tests (`node --test
-tests/js`), and an offscreen render: `tests/offscreen/render.sh --fake-data
+tests/js`), `paste.py` and the `slingshot` command against fake `hyprctl`,
+`wl-copy` and `notify-send` (`tests/paste`), and an offscreen render: `tests/offscreen/render.sh --fake-data
 <dir>` starts Quickshell with `QT_QPA_PLATFORM=offscreen`, a throwaway HOME
 full of canned files (`tests/offscreen/make_fixtures.py`), and no Wayland or
 Hyprland socket in reach. It loads the real `Widget.qml`, checks folder
@@ -191,9 +256,13 @@ can't be exercised offscreen; check it by hand:
 4. Start a drag and press Esc, or let go over the bar: nothing happens and the
    dropdown stays open.
 5. With two monitors, drag a file onto a window on the other one.
-6. Click a row, then Ctrl+Shift+V in foot: the path pastes.
+6. Focus a terminal, open Slingshot, and click a row: the path pastes at the
+   prompt. Do the same in a browser or chat app: the file attaches. Right-click
+   copies it instead.
 7. Save a new screenshot with the dropdown closed: the dot appears, and the
    file is first in the list when you open it.
+8. Super+Alt+D in a terminal: the newest download's path pastes. Super+Alt+Shift+D
+   then 2: the second-newest's.
 
 ## Credits
 
